@@ -270,12 +270,28 @@ def list_python_processes(pod: PodInfo) -> list[ProcessInfo]:
     for line in result.stdout.splitlines():
         if "python" in line.lower():
             parts = line.split(None, 10)
+            # Validate that we have enough parts and parts[1] is numeric (PID)
+            if len(parts) < 11:
+                continue
+            try:
+                pid = int(parts[1])
+            except (ValueError, IndexError):
+                # Skip lines where we can't parse the PID
+                continue
+            
+            try:
+                cpu_percent = float(parts[2])
+                mem_percent = float(parts[3])
+            except (ValueError, IndexError):
+                # Skip lines where we can't parse CPU/memory
+                continue
+            
             processes.append(
                 ProcessInfo(
-                    pid=int(parts[1]),
+                    pid=pid,
                     user=parts[0],
-                    cpu_percent=float(parts[2]),
-                    mem_percent=float(parts[3]),
+                    cpu_percent=cpu_percent,
+                    mem_percent=mem_percent,
                     command=parts[10],
                 )
             )
