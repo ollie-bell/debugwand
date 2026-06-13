@@ -99,6 +99,108 @@ def get_pods_for_service_handler(namespace: str, service: str) -> list[PodInfo]:
     return pod_list
 
 
+def get_deployment_labels(namespace: str, deployment: str) -> dict[str, str]:
+    """Extract selector labels from a Deployment."""
+    cmd = ["kubectl", "get", "deployment", deployment, "-n", namespace, "-o", "json"]
+
+    result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+
+    if result.returncode != 0:
+        if "NotFound" in result.stderr or "not found" in result.stderr:
+            raise ValueError(
+                f"Deployment '{deployment}' not found in namespace '{namespace}'.\n"
+                f"Tip: Check the deployment exists with: kubectl get deployment -n {namespace}"
+            )
+        else:
+            raise subprocess.CalledProcessError(
+                result.returncode, cmd, result.stdout, result.stderr
+            )
+
+    deployment_json = json.loads(result.stdout)
+    selector = deployment_json.get("spec", {}).get("selector", {}).get("matchLabels", {})
+    if not selector:
+        raise ValueError(
+            f"Deployment '{deployment}' has no selector labels."
+        )
+    return selector
+
+
+def get_pods_by_deployment(namespace: str, deployment: str) -> list[PodInfo]:
+    """Get pods owned by a specific Deployment."""
+    try:
+        labels = get_deployment_labels(namespace, deployment)
+    except ValueError as e:
+        raise e
+
+    label_selector = ",".join(f"{key}={value}" for key, value in labels.items())
+    return get_pods_by_label(namespace=namespace, label_selector=label_selector)
+
+
+def get_pods_by_deployment_handler(namespace: str, deployment: str) -> list[PodInfo]:
+    try:
+        pod_list = get_pods_by_deployment(namespace=namespace, deployment=deployment)
+    except ValueError as e:
+        typer.echo(f"❌ {e}", err=True)
+        raise typer.Exit(code=1)
+
+    if not pod_list:
+        typer.echo("❌ No pods found matching the deployment.", err=True)
+        raise typer.Exit(code=1)
+    return pod_list
+
+
+def get_pods_by_owner(
+    namespace: str, owner_kind: str, owner_name: str
+) -> list[PodInfo]:
+    """Generic method to get pods owned by any workload type (Deployment, StatefulSet, etc.)."""
+    if owner_kind.lower() == "deployment":
+        return get_pods_by_deployment(namespace, owner_name)
+    elif owner_kind.lower() == "statefulset":
+        # StatefulSets also use matchLabels in selector
+        cmd = [
+            "kubectl",
+            "get",
+            "statefulset",
+            owner_name,
+            "-n",
+            namespace,
+            "-o",
+            "json",
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        if result.returncode != 0:
+            raise ValueError(f"StatefulSet '{owner_name}' not found in namespace '{namespace}'.")
+        ss_json = json.loads(result.stdout)
+        labels = ss_json.get("spec", {}).get("selector", {}).get("matchLabels", {})
+        if not labels:
+            raise ValueError(f"StatefulSet '{owner_name}' has no selector labels.")
+        label_selector = ",".join(f"{key}={value}" for key, value in labels.items())
+        return get_pods_by_label(namespace=namespace, label_selector=label_selector)
+    elif owner_kind.lower() == "daemonset":
+        # DaemonSets also use matchLabels
+        cmd = [
+            "kubectl",
+            "get",
+            "daemonset",
+            owner_name,
+            "-n",
+            namespace,
+            "-o",
+            "json",
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        if result.returncode != 0:
+            raise ValueError(f"DaemonSet '{owner_name}' not found in namespace '{namespace}'.")
+        ds_json = json.loads(result.stdout)
+        labels = ds_json.get("spec", {}).get("selector", {}).get("matchLabels", {})
+        if not labels:
+            raise ValueError(f"DaemonSet '{owner_name}' has no selector labels.")
+        label_selector = ",".join(f"{key}={value}" for key, value in labels.items())
+        return get_pods_by_label(namespace=namespace, label_selector=label_selector)
+    else:
+        raise ValueError(f"Unsupported owner kind: {owner_kind}")
+
+
 def get_pods_by_label(
     namespace: str | None, label_selector: str | None
 ) -> list[PodInfo]:
@@ -122,6 +224,19 @@ def get_pods_by_label(
         )
         for item in pods_json.get("items", [])
     ]
+
+
+def get_pods_by_label_handler(namespace: str, label_selector: str) -> list[PodInfo]:
+    try:
+        pod_list = get_pods_by_label(namespace=namespace, label_selector=label_selector)
+    except ValueError as e:
+        typer.echo(f"❌ {e}", err=True)
+        raise typer.Exit(code=1)
+
+    if not pod_list:
+        typer.echo("❌ No pods found matching the label selector.", err=True)
+        raise typer.Exit(code=1)
+    return pod_list
 
 
 def get_and_select_pod(service: str, namespace: str) -> PodInfo:

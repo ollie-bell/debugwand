@@ -29,6 +29,44 @@ app = typer.Typer()
 console = Console()
 
 
+def _validate_pod_target_options(
+    service: str | None, deployment: str | None, label_selector: str | None
+) -> None:
+    """Validate that exactly one pod targeting method is specified."""
+    options_provided = sum(
+        [service is not None, deployment is not None, label_selector is not None]
+    )
+    if options_provided == 0:
+        typer.echo(
+            "❌ Must specify one of: --service, --deployment, or --label-selector",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+    elif options_provided > 1:
+        typer.echo(
+            "❌ Cannot use multiple targeting options. Specify only one of: --service, --deployment, or --label-selector",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+
+
+def _get_pod_list(
+    namespace: str,
+    service: str | None,
+    deployment: str | None,
+    label_selector: str | None,
+) -> list[PodInfo]:
+    """Get pod list using the specified targeting method."""
+    if service:
+        return k8s.get_pods_for_service_handler(namespace, service)
+    elif deployment:
+        return k8s.get_pods_by_deployment_handler(namespace, deployment)
+    elif label_selector:
+        return k8s.get_pods_by_label_handler(namespace, label_selector)
+    else:
+        raise ValueError("No pod targeting method specified")
+
+
 @app.command(help="List pods in the specified namespace.")
 def pods(
     namespace: str = typer.Option(
@@ -38,19 +76,35 @@ def pods(
         help="The namespace to list pods from.",
     ),
     service: str = typer.Option(
-        ..., "--service", "-s", help="The service to filter pods by."
+        None, "--service", "-s", help="The Kubernetes service to filter pods by."
+    ),
+    deployment: str = typer.Option(
+        None,
+        "--deployment",
+        "-d",
+        help="The Kubernetes deployment to filter pods by.",
+    ),
+    label_selector: str = typer.Option(
+        None,
+        "--label-selector",
+        "-l",
+        help="Filter pods by label selector (e.g., app=myapp,tier=backend).",
     ),
     with_pids: bool = typer.Option(
         False, "--with-pids", help="Also list Python processes in each pod."
     ),
 ):
-    if with_pids:
-        pod_list = k8s.get_pods_for_service_handler(namespace, service)
+    _validate_pod_target_options(service, deployment, label_selector)
 
+    pod_list = _get_pod_list(namespace, service, deployment, label_selector)
+
+    if with_pids:
         # Collect all pod-process pairs
         pod_processes: list[tuple[PodInfo, list[ProcessInfo]]] = []
         for pod in pod_list:
-            processes: list[ProcessInfo] | None = k8s.list_python_processes_handler(pod)
+            processes: list[ProcessInfo] | None = k8s.list_python_processes_handler(
+                pod
+            )
             if processes:
                 pod_processes.append((pod, processes))
 
@@ -61,8 +115,6 @@ def pods(
             typer.echo("❌ No running pods with Python processes found.", err=True)
             raise typer.Exit(code=1)
     else:
-        pod_list = k8s.get_pods_for_service_handler(namespace, service)
-
         render_pods_table(pod_list)
 
 
@@ -71,11 +123,24 @@ def inject(
     namespace: str = typer.Option(
         ..., "--namespace", "-n", help="The namespace to use."
     ),
-    service: str = typer.Option(..., "--service", "-s", help="The service to use."),
+    service: str = typer.Option(
+        None, "--service", "-s", help="The Kubernetes service to use."
+    ),
+    deployment: str = typer.Option(
+        None, "--deployment", "-d", help="The Kubernetes deployment to use."
+    ),
+    label_selector: str = typer.Option(
+        None,
+        "--label-selector",
+        "-l",
+        help="Filter pods by label selector (e.g., app=myapp,tier=backend).",
+    ),
     script: str = typer.Option(..., "--script", "-c", help="The script to execute."),
 ):
+    _validate_pod_target_options(service, deployment, label_selector)
+
     typer.echo(f"Executing script '{script}' in the selected pod...")
-    pod_list = k8s.get_pods_for_service_handler(namespace, service)
+    pod_list = _get_pod_list(namespace, service, deployment, label_selector)
     pod = k8s.select_pod(pod_list)
 
     processes: list[ProcessInfo] | None = k8s.list_python_processes_handler(pod)
@@ -345,7 +410,11 @@ def _monitor_and_handle_reload_mode(
 
 
 def _attempt_reconnect(
-    pod: PodInfo, service: str, namespace: str
+    pod: PodInfo,
+    namespace: str,
+    service: str | None = None,
+    deployment: str | None = None,
+    label_selector: str | None = None,
 ) -> tuple[PodInfo | None, int | None]:
     """
     Try to reconnect to a new pod after connection loss.
@@ -353,10 +422,41 @@ def _attempt_reconnect(
     """
     print_step("Connection lost, attempting to reconnect...")
     try:
-        new_pod = k8s.find_replacement_pod(pod, service, namespace)
-        if not new_pod:
-            print_info("Could not find replacement pod, waiting...")
-            new_pod = k8s.wait_for_new_pod(service, namespace)
+        if service:
+            new_pod = k8s.find_replacement_pod(pod, service, namespace)
+            if not new_pod:
+                print_info("Could not find replacement pod, waiting...")
+                new_pod = k8s.wait_for_new_pod(service, namespace)
+        elif deployment:
+            # For deployments, get fresh pod list
+            pods = k8s.get_pods_by_deployment(namespace, deployment)
+            running_pods = [p for p in pods if p.status == "Running"]
+            if not running_pods:
+                print_info("No running pods found, waiting...")
+                time.sleep(5)
+                pods = k8s.get_pods_by_deployment(namespace, deployment)
+                running_pods = [p for p in pods if p.status == "Running"]
+            if not running_pods:
+                return None, None
+            new_pod = sorted(running_pods, key=lambda p: p.creation_time, reverse=True)[
+                0
+            ]
+        elif label_selector:
+            # For label selector, get fresh pod list
+            pods = k8s.get_pods_by_label(namespace, label_selector)
+            running_pods = [p for p in pods if p.status == "Running"]
+            if not running_pods:
+                print_info("No running pods found, waiting...")
+                time.sleep(5)
+                pods = k8s.get_pods_by_label(namespace, label_selector)
+                running_pods = [p for p in pods if p.status == "Running"]
+            if not running_pods:
+                return None, None
+            new_pod = sorted(running_pods, key=lambda p: p.creation_time, reverse=True)[
+                0
+            ]
+        else:
+            return None, None
 
         new_pid = k8s.get_and_select_process_handler(pod=new_pod, pid=None)
         print_success(f"Reconnected to new pod: {new_pod.name}")
@@ -399,6 +499,20 @@ def debug(
         help="The Kubernetes service to use.",
         rich_help_panel="Kubernetes Options",
     ),
+    deployment: str = typer.Option(
+        None,
+        "--deployment",
+        "-d",
+        help="The Kubernetes deployment to use.",
+        rich_help_panel="Kubernetes Options",
+    ),
+    label_selector: str = typer.Option(
+        None,
+        "--label-selector",
+        "-l",
+        help="Filter pods by label selector (e.g., app=myapp,tier=backend).",
+        rich_help_panel="Kubernetes Options",
+    ),
     container: str = typer.Option(
         None,
         "--container",
@@ -422,26 +536,27 @@ def debug(
 ):
     if container:
         # Container mode - error if k8s options are also provided
-        if namespace or service:
+        if namespace or service or deployment or label_selector:
             typer.echo(
-                "❌ Cannot use --namespace or --service with --container.",
+                "❌ Cannot use --namespace, --service, --deployment or --label-selector with --container.",
                 err=True,
             )
             raise typer.Exit(1)
         runtime = container_ops.detect_runtime()
         container_ops.debug(runtime, container, port, pid)
         return
-    elif namespace and service:
-        # Kubernetes mode
-        pass
+    elif namespace:
+        # Kubernetes mode - validate that one targeting method is specified
+        _validate_pod_target_options(service, deployment, label_selector)
     else:
         typer.echo(
-            "❌ Either --container or both --namespace and --service are required.",
+            "❌ Either --container or --namespace is required.",
             err=True,
         )
         raise typer.Exit(1)
 
-    pod = k8s.get_and_select_pod_handler(service=service, namespace=namespace)
+    pod_list = _get_pod_list(namespace, service, deployment, label_selector)
+    pod = k8s.select_pod(pod_list)
     pid = k8s.get_and_select_process_handler(pod=pod, pid=pid)
 
     # Prepare debugpy script on local filesystem (wait=False means app continues immediately)
@@ -497,7 +612,13 @@ def debug(
                     time.sleep(2)
 
                 # Attempt to reconnect to a new pod
-                new_pod, new_pid = _attempt_reconnect(pod, service, namespace)
+                new_pod, new_pid = _attempt_reconnect(
+                    pod,
+                    namespace,
+                    service=service,
+                    deployment=deployment,
+                    label_selector=label_selector,
+                )
                 if not new_pod or not new_pid:
                     break
 
