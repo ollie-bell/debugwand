@@ -260,7 +260,13 @@ def get_and_select_pod_handler(service: str, namespace: str) -> PodInfo:
 
 
 def list_python_processes(pod: PodInfo) -> list[ProcessInfo]:
-    """List Python processes in a pod."""
+    """List Python processes in a pod using ps aux.
+    
+    Handles various ps aux output formats:
+    - Standard: PID USER %CPU %MEM VSZ RSS TTY STAT START TIME COMMAND
+    - Alpine/busybox: PID USER TIME COMMAND (no %CPU, %MEM, VSZ, RSS)
+    - With brackets: {wrapper} /path/to/python
+    """
     if pod.status != "Running":
         raise ValueError(f"Pod '{pod.name}' is not running (status: {pod.status})")
 
@@ -272,33 +278,47 @@ def list_python_processes(pod: PodInfo) -> list[ProcessInfo]:
         # Skip header lines and lines that don't contain python
         if "python" not in line.lower():
             continue
-            
+        
         parts = line.split(None, 10)
         
-        # Validate that we have enough parts
-        if len(parts) < 11:
+        # Validate that we have at least PID, USER, and COMMAND
+        if len(parts) < 4:
             continue
         
         try:
-            pid = int(parts[1])
+            pid = int(parts[0])
         except (ValueError, IndexError):
             # Skip lines where we can't parse the PID
             continue
         
+        user = parts[1]
+        
+        # Try to extract CPU% and MEM% if they exist (standard ps aux format)
+        # In standard format: PID USER %CPU %MEM VSZ RSS TTY STAT START TIME COMMAND
+        # In alpine format: PID USER TIME COMMAND (no CPU/MEM)
+        # We need to detect which format we have
+        
+        cpu_percent = 0.0
+        mem_percent = 0.0
+        command = parts[10] if len(parts) > 10 else ""
+        
         try:
+            # Try to parse parts[2] and parts[3] as CPU% and MEM%
+            # This works for standard ps aux format
             cpu_percent = float(parts[2])
             mem_percent = float(parts[3])
         except (ValueError, IndexError):
-            # Skip lines where we can't parse CPU/memory
-            continue
+            # If we can't parse as floats, this might be alpine format
+            # where parts[2] is TIME, so leave CPU/MEM as 0.0
+            pass
         
         processes.append(
             ProcessInfo(
                 pid=pid,
-                user=parts[0],
+                user=user,
                 cpu_percent=cpu_percent,
                 mem_percent=mem_percent,
-                command=parts[10],
+                command=command,
             )
         )
     
