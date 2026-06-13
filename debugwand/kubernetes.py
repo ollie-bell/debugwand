@@ -267,34 +267,41 @@ def list_python_processes(pod: PodInfo) -> list[ProcessInfo]:
     cmd = ["kubectl", "exec", pod.name, "-n", pod.namespace, "--", "ps", "aux"]
     result = subprocess.run(cmd, capture_output=True, text=True, check=True)
     processes: list[ProcessInfo] = []
+    
     for line in result.stdout.splitlines():
-        if "python" in line.lower():
-            parts = line.split(None, 10)
-            # Validate that we have enough parts and parts[1] is numeric (PID)
-            if len(parts) < 11:
-                continue
-            try:
-                pid = int(parts[1])
-            except (ValueError, IndexError):
-                # Skip lines where we can't parse the PID
-                continue
+        # Skip header lines and lines that don't contain python
+        if "python" not in line.lower():
+            continue
             
-            try:
-                cpu_percent = float(parts[2])
-                mem_percent = float(parts[3])
-            except (ValueError, IndexError):
-                # Skip lines where we can't parse CPU/memory
-                continue
-            
-            processes.append(
-                ProcessInfo(
-                    pid=pid,
-                    user=parts[0],
-                    cpu_percent=cpu_percent,
-                    mem_percent=mem_percent,
-                    command=parts[10],
-                )
+        parts = line.split(None, 10)
+        
+        # Validate that we have enough parts
+        if len(parts) < 11:
+            continue
+        
+        try:
+            pid = int(parts[1])
+        except (ValueError, IndexError):
+            # Skip lines where we can't parse the PID
+            continue
+        
+        try:
+            cpu_percent = float(parts[2])
+            mem_percent = float(parts[3])
+        except (ValueError, IndexError):
+            # Skip lines where we can't parse CPU/memory
+            continue
+        
+        processes.append(
+            ProcessInfo(
+                pid=pid,
+                user=parts[0],
+                cpu_percent=cpu_percent,
+                mem_percent=mem_percent,
+                command=parts[10],
             )
+        )
+    
     return processes
 
 
